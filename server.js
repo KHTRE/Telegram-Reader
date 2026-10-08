@@ -207,16 +207,24 @@ async function checkChannel(channel) {
     .sort((a, b) => a.id - b.id);
 
   for (const message of fresh) {
-    if (!shouldPush(message)) continue;
-    log(`[${channel}] push #${message.id}: ${message.text}`);
-    await push({
-      type: 'message',
-      channel,
-      id: String(message.id),
-      text: message.text,
-      date: message.date,
-      url: message.url,
-    });
+    const logLine = `${channel} - ${message.date} - ${message.text || '(no text)'}`;
+
+    if (shouldPush(message)) {
+      console.log('');
+      console.log(`[PUSH]: ${logLine}`);
+      console.log('');
+
+      await push({
+        type: 'message',
+        channel,
+        id: String(message.id),
+        text: message.text,
+        date: message.date,
+        url: message.url,
+      });      
+    } else {
+      console.log(logLine);
+    }
   }
 
   if (fresh.length > 0) {
