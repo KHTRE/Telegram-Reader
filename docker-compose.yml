@@ -1,0 +1,24 @@
+services:
+  alert-bridge:
+    build: .
+    container_name: alert-bridge
+    restart: unless-stopped
+    mem_limit: 192m
+    cpus: 0.25
+    environment:
+      CONFIG_PATH: /app/config.json
+      SERVICE_ACCOUNT_PATH: /run/secrets/service-account.json
+      STATE_PATH: /data/state.json
+      TZ: Europe/Kyiv
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./service-account.json:/run/secrets/service-account.json:ro
+      - alert-bridge-data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  alert-bridge-data:
