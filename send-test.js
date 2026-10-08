@@ -11,7 +11,7 @@ initializeApp({
 getMessaging()
   .send({
     topic: config.fcmTopic,
-    data: { type: 'message', channel: 'test', id: '0', text: "Тест. Це тестове повідомлення", date: '', url: '' },
+    data: { type: 'message', channel: 'test', id: '0', text: "Тест. деверзе, дврз, бпла, бепеела", date: '', url: '' },
     android: { priority: 'high', ttl: 5 * 60 * 1000 },
   })
 getMessaging()

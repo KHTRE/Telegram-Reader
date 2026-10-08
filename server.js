@@ -254,6 +254,8 @@ async function checkHealth() {
 
 async function main() {
   log(`channels: ${CHANNELS.map((c) => `@${c}`).join(', ')}`);
+  log(`search for: ${SEARCH_FOR.map((c) => `@${c}`).join(', ')}`);
+  log(`exclude from search: ${EXCLUDE_FROM_SEARCH.map((c) => `@${c}`).join(', ')}`);
   log(`poll every ${POLL_INTERVAL / 1000}s, filtering ${FILTERING_ON ? 'on' : 'off'}`);
 
   setInterval(() => {
