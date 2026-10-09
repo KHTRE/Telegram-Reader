@@ -1,0 +1,10 @@
+{
+  "filteringOn": false,
+  "messageLength": 200,
+  "pollInterval": 5000,
+  "maxAgeMinutes": 10,
+  "channels": ["nebo_raketa", "kyiv_nebo", "Ukrainian_Intelligence", "kievreal1"],
+  "searchFor": ["word1", "word2"],
+  "excludeFromSearch": ["word3"],
+  "fcmTopic": "alerts-k7x2q9m4"
+}
