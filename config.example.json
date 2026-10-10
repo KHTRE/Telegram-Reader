@@ -1,5 +1,5 @@
 {
   "maxAgeMinutes": 3,
-  "channels": ["channel_one", "channel_two"],
-  "pollSeconds": 5
+  "pollSeconds": 5,
+  "channels": ["channel_one", "channel_two"]
 }

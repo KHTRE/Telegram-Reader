@@ -37,26 +37,32 @@ const POLL_INTERVAL_MS = (config.pollSeconds ?? 5) * 1000;
 // Dialogs whose latest message is older than the previous poll minus this
 // margin cannot contain anything new, so the pass stops there.
 const POLL_MARGIN_MS = 60 * 1000;
-const DIALOG_LIMIT = 600;
+const DIALOG_LIMIT = 600; // used by both the channel map and polling
 const SLOW_POLL_MS = 3000; // warn when one pass takes longer than this
+const POLL_TIMEOUT_MS = 30 * 1000; // a pass that takes longer counts as failed
+const FIRST_POLL_TIMEOUT_MS = 120 * 1000; // the startup catch-up may read a lot
+const CHANNELS_REFRESH_MS = 10 * 60 * 1000; // re-read which channels are joined
 
 const STATS_INTERVAL_MS = 60 * 1000 * 10;
 const PING_INTERVAL_MS = 20 * 1000;
-const HEALTH_THRESHOLD_MS = 60 * 1000; // alert phones after 1 min of silence
+const HEALTH_THRESHOLD_MS = 60 * 1000; // alert phones after 1 min without a good poll
 const HEALTH_COOLDOWN_MS = 10 * 60 * 1000; // at most one alert per 10 min
 const SELF_RESTART_MS = 3 * 60 * 1000; // exit (Docker restarts us) after 3 min
 const PUSH_TTL_MS = 2 * 60 * 1000; // FCM drops undelivered alerts after 2 min
+const FCM_TEXT_MAX_BYTES = 3000; // FCM data messages are limited to 4 KB in total
 const MAX_WORDS = 50;
 
 const log = (...args) => console.log(new Date().toISOString(), ...args);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const withTimeout = (promise, ms) =>
-  Promise.race([
+const withTimeout = (promise, ms) => {
+  let timer;
+  return Promise.race([
     promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms)
-    ),
-  ]);
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+};
 
 if (CHANNELS.length === 0) {
   console.error('config.json needs a non-empty "channels" list');
@@ -77,7 +83,7 @@ const client = new TelegramClient(new StringSession(tg.session), tg.apiId, tg.ap
 client.setLogLevel('error');
 
 // ---------------------------------------------------------
-// STATS (one line per minute, shows the server is alive)
+// STATS (one summary line every STATS_INTERVAL_MS, shows the server is alive)
 // ---------------------------------------------------------
 
 const stats = {
@@ -96,7 +102,7 @@ const stats = {
 function printStats() {
   const avg = stats.polls ? Math.round(stats.pollMsTotal / stats.polls) : 0;
   log(
-    `[-STATS-] last min: polls=${stats.polls} (avg ${avg}ms, max ${stats.pollMsMax}ms, ` +
+    `[-STATS-] last ${STATS_INTERVAL_MS / 60000} min: polls=${stats.polls} (avg ${avg}ms, max ${stats.pollMsMax}ms, ` +
       `errors ${stats.pollErrors}, flood waits ${stats.floodWaits}), ` +
       `received ${stats.newPosts} new message(s), pushed ${stats.pushedPosts}, ` +
       `matched ${stats.devicesMatched} device(s), push ok ${stats.pushOk}, push failed ${stats.pushFailed}, ` +
@@ -147,16 +153,53 @@ function markSeen(channel, id) {
 }
 
 // ---------------------------------------------------------
+// TEXT
+// ---------------------------------------------------------
+
+// Text shown in the app: original case and punctuation, only junk removed.
+function cleanText(raw) {
+  return (raw || '')
+    .replace(/[\u3164\u200B-\u200D\u2060\uFEFF]/g, '') // invisible fillers (kievreal1 uses them)
+    .replace(/[^\S\n]+/g, ' ')   // runs of spaces/tabs -> one space
+    .replace(/ ?\n ?/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+// Private copy used only for filtering. Never sent to the phone.
+// Filter words and phrases go through the same function, so they always match.
+function forSearch(text) {
+  return text.toLowerCase().replace(/\//g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function formatDate(ts) {
+  return new Date(ts).toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv', hour12: false });
+}
+
+// FCM rejects data messages over 4 KB and Cyrillic takes 2 bytes per character,
+// so a very long post is shortened for the push (the full text is still on Telegram).
+function fitForFcm(text, maxBytes = FCM_TEXT_MAX_BYTES) {
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
+  let cut = text;
+  while (Buffer.byteLength(`${cut}…`, 'utf8') > maxBytes) {
+    cut = cut.slice(0, Math.floor(cut.length * 0.9));
+  }
+  const last = cut.charCodeAt(cut.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) cut = cut.slice(0, -1); // do not split an emoji
+  return `${cut.trimEnd()}…`;
+}
+
+// ---------------------------------------------------------
 // DEVICES (per-user settings, live from Firestore)
 // ---------------------------------------------------------
 
-const devices = new Map(); // uid -> { token, channels:Set, search, exclude, maxLength }
+const devices = new Map(); // uid -> { token, updatedAt, channels:Set, search, exclude, maxLength }
 
 function cleanWords(list) {
   if (!list || !Array.isArray(list.words)) return [];
   return list.words
     .filter((w) => typeof w === 'string')
-    .map((w) => w.toLowerCase().trim())
+    .map(forSearch)
     .filter(Boolean)
     .slice(0, MAX_WORDS);
 }
@@ -170,6 +213,7 @@ function parseDevice(data) {
   const maxValue = data.maxLength && Number(data.maxLength.value);
   return {
     token: data.token,
+    updatedAt: Number(data.updatedAt) || 0,
     channels: new Set(channels),
     search: { enabled: !!(data.search && data.search.enabled === true), words: cleanWords(data.search) },
     exclude: { enabled: !!(data.exclude && data.exclude.enabled === true), words: cleanWords(data.exclude) },
@@ -180,6 +224,22 @@ function parseDevice(data) {
   };
 }
 
+// The same phone can end up registered twice (reinstall, expired anonymous
+// account). Keep the newest registration and remove the older ones, otherwise
+// the phone would get every alert twice, some with outdated filters.
+function dropDuplicateTokens() {
+  const newest = new Map(); // token -> uid of the newest registration
+  for (const [uid, device] of devices) {
+    const best = newest.get(device.token);
+    if (best === undefined || device.updatedAt > devices.get(best).updatedAt) {
+      newest.set(device.token, uid);
+    }
+  }
+  for (const [uid, device] of [...devices]) {
+    if (newest.get(device.token) !== uid) removeDevice(uid, 'duplicate registration of the same phone');
+  }
+}
+
 function watchDevices() {
   db.collection('devices').onSnapshot(
     (snapshot) => {
@@ -188,6 +248,7 @@ function watchDevices() {
         if (device) devices.set(change.doc.id, device);
         else devices.delete(change.doc.id);
       }
+      dropDuplicateTokens();
       log(`devices registered: ${devices.size}`);
     },
     (error) => {
@@ -212,34 +273,11 @@ function matches(device, searchText, length) {
 }
 
 // ---------------------------------------------------------
-// TEXT
-// ---------------------------------------------------------
-
-// Text shown in the app: original case and punctuation, only junk removed.
-function cleanText(raw) {
-  return (raw || '')
-    .replace(/[\u3164\u200B-\u200D\u2060\uFEFF]/g, '') // invisible fillers (kievreal1 uses them)
-    .replace(/[^\S\n]+/g, ' ')   // runs of spaces/tabs -> one space
-    .replace(/ ?\n ?/g, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
-// Private copy used only for filtering. Never sent to the phone.
-function forSearch(text) {
-  return text.toLowerCase().replace(/\//g, ' ').replace(/\s+/g, ' ');
-}
-
-function formatDate(ts) {
-  return new Date(ts).toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv', hour12: false });
-}
-
-// ---------------------------------------------------------
 // PUSH
 // ---------------------------------------------------------
 
-function removeDevice(uid) {
-  log(`removing dead device ${uid.slice(0, 6)}`);
+function removeDevice(uid, reason = 'dead device') {
+  log(`removing ${reason}: ${uid.slice(0, 6)}`);
   devices.delete(uid);
   db.collection('devices').doc(uid).delete().catch(() => {});
 }
@@ -323,37 +361,44 @@ async function handleMessage(channel, id, rawText, ts, source) {
     return;
   }
 
-  const result = await push(recipients, {
+  // Not awaited: a slow FCM call must not delay the other channels in this pass.
+  push(recipients, {
     type: 'message',
     channel,
     id: String(id),
-    text,
+    text: fitForFcm(text),
     date,
     url: `https://t.me/${channel}/${id}`,
-  });
-
-  stats.pushedPosts++;
-  stats.devicesMatched += recipients.length;
-  stats.pushOk += result.ok;
-  stats.pushFailed += result.failed;
-
-  log(
-    `[${source}] received 1 new message, found ${recipients.length} subscribed device(s) (of ${devices.size}), ` +
-      `${result.ok} push successful, ${result.failed} failed: ${line}`
-  );
+  })
+    .then((result) => {
+      stats.pushedPosts++;
+      stats.devicesMatched += recipients.length;
+      stats.pushOk += result.ok;
+      stats.pushFailed += result.failed;
+      log(
+        `[${source}] received 1 new message, found ${recipients.length} subscribed device(s) (of ${devices.size}), ` +
+          `${result.ok} push successful, ${result.failed} failed: ${line}`
+      );
+    })
+    .catch((error) => log(`push failed: ${error.message}`));
 }
 
 // ---------------------------------------------------------
 // TELEGRAM: channel map, live updates, polling
 // ---------------------------------------------------------
 
-const channelById = new Map(); // raw channel id (string) -> configured username
+let channelById = new Map(); // raw channel id (string) -> configured username
+let publishedList = '';
 
-async function loadChannels() {
-  channelById.clear();
-
-  const dialogs = await client.getDialogs({ limit: 500 });
+// Reads which of the configured channels the account has joined. Runs at
+// startup and every CHANNELS_REFRESH_MS, so a channel joined later is picked up
+// without a restart. The new map replaces the old one in one step.
+async function loadChannels({ initial = false } = {}) {
+  const map = new Map();
+  const titles = {}; // username -> channel name as shown in Telegram
   const others = [];
+
+  const dialogs = await client.getDialogs({ limit: DIALOG_LIMIT });
   for (const dialog of dialogs) {
     const entity = dialog.entity;
     if (!entity) continue;
@@ -365,25 +410,34 @@ async function loadChannels() {
     const match = names.find((n) => CHANNEL_SET.has(n));
 
     if (match) {
-      channelById.set(String(entity.id), match);
+      map.set(String(entity.id), match);
+      if (entity.title) titles[match] = entity.title;
     } else {
       others.push(`${entity.className}: ${entity.title || entity.firstName || '?'} (@${names[0] || 'no username'})`);
     }
   }
 
-  const found = new Set(channelById.values());
+  const found = new Set(map.values());
+  const list = CHANNELS.filter((c) => found.has(c));
   const missing = CHANNELS.filter((c) => !found.has(c));
-  log(`listening to ${found.size}/${CHANNELS.length} channels`);
-  if (missing.length > 0) {
-    log(`WARNING not joined or not found (run join.js): ${missing.join(', ')}`);
-    log(`other chats this account has (not in config): ${others.join('; ') || 'none'}`);
+  const signature = JSON.stringify({ list, titles });
+  const changed = signature !== publishedList;
+
+  channelById = map;
+
+  if (initial || changed) {
+    log(`listening to ${found.size}/${CHANNELS.length} channels`);
+    if (missing.length > 0) {
+      log(`WARNING not joined or not found (run join.js): ${missing.join(', ')}`);
+      log(`other chats this account has (not in config): ${others.join('; ') || 'none'}`);
+    }
   }
 
   // Publish the list the app shows. Only channels we really listen to.
-  await db.doc('config/channels').set({
-    list: CHANNELS.filter((c) => found.has(c)),
-    updatedAt: Date.now(),
-  });
+  if (changed) {
+    await db.doc('config/channels').set({ list, titles, updatedAt: Date.now() });
+    publishedList = signature;
+  }
 }
 
 // Live updates. Telegram does not push big channels to this session, so this
@@ -457,15 +511,21 @@ async function pollOnce() {
   return took;
 }
 
+let lastPollOkAt = Date.now(); // last poll pass that finished successfully
+let floodUntil = 0; // while Telegram makes us wait, restarting would not help
+
 async function pollLoop() {
   while (true) {
     let took = 0;
     try {
-      took = await pollOnce();
+      // A pass that hangs counts as failed: the timeout makes the health check see it.
+      took = await withTimeout(pollOnce(), firstPass ? FIRST_POLL_TIMEOUT_MS : POLL_TIMEOUT_MS);
+      lastPollOkAt = Date.now();
     } catch (error) {
       stats.pollErrors++;
       if (error.seconds) {
         stats.floodWaits++;
+        floodUntil = Date.now() + (error.seconds + 1) * 1000;
         log(`poll: FLOOD WAIT ${error.seconds}s, sleeping (consider raising pollSeconds)`);
         await sleep((error.seconds + 1) * 1000);
       } else {
@@ -480,14 +540,14 @@ async function pollLoop() {
 // CONNECTION HEALTH
 // ---------------------------------------------------------
 
-let lastSuccessAt = Date.now();
 let lastAlertAt = 0;
 let outage = false;
 
+// Keeps the connection warm and logs trouble. It does NOT count as "healthy":
+// only successful poll passes do, so a stuck poll loop cannot hide behind it.
 async function pingTelegram() {
   try {
     await withTimeout(client.getMe(), 10 * 1000);
-    lastSuccessAt = Date.now();
   } catch (error) {
     log(`telegram ping failed: ${error.message}`);
   }
@@ -495,12 +555,12 @@ async function pingTelegram() {
 
 async function checkHealth() {
   const now = Date.now();
-  const silence = now - lastSuccessAt;
+  const silence = now - lastPollOkAt;
 
   // Wedged connection: exit so Docker restarts the container. The first poll
   // pass on startup recovers anything posted in the meantime.
-  if (silence >= SELF_RESTART_MS) {
-    log('no contact with Telegram for 3+ min, exiting for restart');
+  if (silence >= SELF_RESTART_MS && now > floodUntil) {
+    log('no successful poll for 3+ min, exiting for restart');
     saveState();
     process.exit(1);
   }
@@ -510,7 +570,7 @@ async function checkHealth() {
     lastAlertAt = now;
     outage = true;
     const r = await push(allDevices(), { type: 'system', text: "Втрачено з'єднання з Telegram" });
-    log(`no contact with Telegram for 1+ min, alert sent to ${r.ok} device(s), ${r.failed} failed`);
+    log(`no successful poll for 1+ min, alert sent to ${r.ok} device(s), ${r.failed} failed`);
   } else if (!down && outage) {
     outage = false;
     const r = await push(allDevices(), { type: 'system', text: "З'єднання з Telegram відновлено" });
@@ -528,9 +588,9 @@ async function main() {
     console.error('Telegram session is not authorized. Run login.js again.');
     process.exit(1);
   }
-  lastSuccessAt = Date.now();
+  lastPollOkAt = Date.now();
 
-  await loadChannels();
+  await loadChannels({ initial: true });
   watchDevices();
   client.addEventHandler(onNewMessage, new NewMessage({}));
 
@@ -542,6 +602,9 @@ async function main() {
   }, 10 * 1000);
   setInterval(saveState, 5 * 1000);
   setInterval(printStats, STATS_INTERVAL_MS);
+  setInterval(() => {
+    loadChannels().catch((e) => log(`channel refresh failed: ${e.message}`));
+  }, CHANNELS_REFRESH_MS);
 
   pollLoop().catch((e) => {
     log(`poll loop stopped: ${e.message}, exiting for restart`);
