@@ -11,6 +11,10 @@
   },
   "dependencies": {
     "cheerio": "^1.2.0",
-    "firebase-admin": "^14.5.0"
+    "firebase-admin": "^14.5.0",
+    "telegram": "^2.26.22"
+  },
+  "devDependencies": {
+    "qrcode-terminal": "^0.12.0"
   }
 }

@@ -10,4 +10,4 @@ COPY server.js ./
 RUN mkdir /data && chown node:node /data
 USER node
 
-CMD ["node", "--max-old-space-size=96", "server.js"]
+CMD ["node", "--max-old-space-size=160", "server.js"]

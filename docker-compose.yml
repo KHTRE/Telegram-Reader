@@ -3,16 +3,18 @@ services:
     build: .
     container_name: alert-bridge
     restart: unless-stopped
-    mem_limit: 192m
-    cpus: 0.25
+    mem_limit: 256m
+    cpus: 0.5
     environment:
       CONFIG_PATH: /app/config.json
       SERVICE_ACCOUNT_PATH: /run/secrets/service-account.json
+      TELEGRAM_PATH: /run/secrets/telegram.json
       STATE_PATH: /data/state.json
       TZ: Europe/Kyiv
     volumes:
       - ./config.json:/app/config.json:ro
       - ./service-account.json:/run/secrets/service-account.json:ro
+      - ./telegram.json:/run/secrets/telegram.json:ro
       - alert-bridge-data:/data
     logging:
       driver: json-file
