@@ -197,15 +197,15 @@ function watchDevices() {
   );
 }
 
-function matches(device, text) {
-  if (device.maxLength.enabled && device.maxLength.value > 0 && text.length > device.maxLength.value) {
+function matches(device, searchText, length) {
+  if (device.maxLength.enabled && device.maxLength.value > 0 && length > device.maxLength.value) {
     return false;
   }
-  if (device.exclude.enabled && device.exclude.words.some((w) => text.includes(w))) {
+  if (device.exclude.enabled && device.exclude.words.some((w) => searchText.includes(w))) {
     return false;
   }
   if (device.search.enabled && device.search.words.length > 0 &&
-      !device.search.words.some((w) => text.includes(w))) {
+      !device.search.words.some((w) => searchText.includes(w))) {
     return false;
   }
   return true;
@@ -215,17 +215,19 @@ function matches(device, text) {
 // TEXT
 // ---------------------------------------------------------
 
-// Word replacements for the voice (дврз -> деверзе, ...) live in the app.
-// The server only cleans the text, so users' filter words match what they type.
-function normalize(raw) {
-  const text = (raw || '')
-    .replace(/\n+/g, '. ')
-    .replace(/\//g, ' ')
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\p{P}\p{Z}]/gu, '')
-    .replace(/\s+/g, ' ')
+// Text shown in the app: original case and punctuation, only junk removed.
+function cleanText(raw) {
+  return (raw || '')
+    .replace(/[\u3164\u200B-\u200D\u2060\uFEFF]/g, '') // invisible fillers (kievreal1 uses them)
+    .replace(/[^\S\n]+/g, ' ')   // runs of spaces/tabs -> one space
+    .replace(/ ?\n ?/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
     .trim();
-  return text ? `${text}. ` : '';
+}
+
+// Private copy used only for filtering. Never sent to the phone.
+function forSearch(text) {
+  return text.toLowerCase().replace(/\//g, ' ').replace(/\s+/g, ' ');
 }
 
 function formatDate(ts) {
@@ -293,8 +295,10 @@ async function handleMessage(channel, id, rawText, ts, source) {
   stats.newPosts++;
   if (source === 'catchup') catchupPosts++;
 
-  const text = normalize(rawText);
+  const text = cleanText(rawText);
   if (!text) return; // photo-only posts etc.
+
+  const searchText = forSearch(text);
 
   if (Date.now() - ts > MAX_AGE_MS) {
     if (source === 'catchup') catchupTooOld++;
@@ -304,11 +308,12 @@ async function handleMessage(channel, id, rawText, ts, source) {
 
   const date = formatDate(ts);
   const lag = Math.round((Date.now() - ts) / 1000);
-  const line = `${channel}#${id} - ${date} - ${text}(lag ${lag}s)`;
+
+  const line = `${channel}#${id} - ${date} - ${text.replace(/\n/g, ' ')} (lag ${lag}s)`;
 
   const recipients = [];
   for (const [uid, device] of devices) {
-    if (device.channels.has(channel) && matches(device, text)) {
+    if (device.channels.has(channel) && matches(device, searchText, text.length)) {
       recipients.push({ uid, token: device.token });
     }
   }
